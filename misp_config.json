@@ -1,0 +1,8 @@
+{
+    "misp_url": "https://misp.local",
+    "misp_key": "HZanijP2MDs8UToCdXfWDYR24CtzkAuM8lreJUoj",
+    "verify_ssl": false,
+    "reload_suricata": true,
+    "suricata_reload_command": "sudo systemctl reload suricata",
+    "tracking_file": "/var/lib/suricata/misp_imported_rules.json"
+}
