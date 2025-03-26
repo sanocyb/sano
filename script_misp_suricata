@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-
+"""
+Script pour extraire les règles Suricata/Snort depuis MISP et
+mettre à jour le fichier de règles de Suricata en fonction du modèle Diamond.
+Ce script recherche tous les attributs de type suricata/snort et les enregistre
+dans un fichier de règles, en mappant les règles selon les facettes du Diamond Model
+(Adversaire, Infrastructure, Capacité, Victime).
+"""
 
 import os
 import json
@@ -7,14 +13,24 @@ import argparse
 import sys
 import requests
 import urllib3
+import re
 from datetime import datetime
+from collections import defaultdict
 
 # Ignorer les avertissements SSL si verify_ssl est désactivé
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Définition des facettes du Diamond Model
+DIAMOND_FACETS = [
+    "adversary",     # Adversaire
+    "capability",    # Capacité
+    "infrastructure", # Infrastructure
+    "victim"         # Victime
+]
+
 def parse_args():
     """Analyse des arguments de la ligne de commande"""
-    parser = argparse.ArgumentParser(description="Extraire les règles Suricata/Snort depuis MISP")
+    parser = argparse.ArgumentParser(description="Extraire les règles Suricata/Snort depuis MISP et les organiser selon le Diamond Model")
     parser.add_argument(
         "-c", "--config",
         default="misp_config.json",
@@ -24,6 +40,11 @@ def parse_args():
         "-o", "--output",
         default="/etc/suricata/rules/misp_rules.rules",
         help="Fichier de sortie pour les règles (par défaut: /etc/suricata/rules/misp_rules.rules)"
+    )
+    parser.add_argument(
+        "-d", "--diamond",
+        action="store_true",
+        help="Organiser les règles selon le Diamond Model"
     )
     parser.add_argument(
         "-e", "--event",
@@ -62,34 +83,60 @@ def extract_rules_from_event(misp_url, misp_key, event_id, verify_ssl=False, ver
         verbose: Mode verbeux
 
     Returns:
-        Liste des règles trouvées (avec potentiel futur mapping Diamond)
+        Liste des dictionnaires contenant les règles et leurs métadonnées Diamond
     """
     headers = {'Authorization': misp_key, 'Accept': 'application/json'}
     print(f"Extraction des règles de l'événement {event_id}...")
     print(f"Méthode 1: Récupération JSON de l'événement {event_id}")
-    url = f"{misp_url}/events/{event_id}"
-
+    url = f"{misp_url}/events/view/{event_id}"
+    
     try:
         response = requests.get(url, headers=headers, verify=verify_ssl, timeout=15)
         if response.status_code == 200:
             event_data = response.json()
-            suricata_attrs = []
+            event_info = event_data.get('Event', {})
+            
+            # Listes pour stocker les règles et leurs métadonnées
+            rule_entries = []
+            
             # Extraction depuis la section principale des attributs
-            for attr in event_data.get('Event', {}).get('Attribute', []):
+            for attr in event_info.get('Attribute', []):
                 if attr.get('type') in ['suricata', 'snort'] and attr.get('to_ids'):
                     if verbose:
                         print(f"Attribut trouvé: ID {attr.get('id')} - Type {attr.get('type')}")
-                    suricata_attrs.append(attr.get('value'))
+                    
+                    # Créer l'entrée de règle avec les métadonnées Diamond
+                    rule_entry = {
+                        'rule': attr.get('value'),
+                        'event_id': event_id,
+                        'event_info': event_info.get('info', ''),
+                        'date': event_info.get('date', ''),
+                        'tags': [tag.get('name', '') for tag in attr.get('Tag', [])],
+                        'diamond': extract_diamond_metadata(attr, event_info)
+                    }
+                    rule_entries.append(rule_entry)
+            
             # Extraction dans les objets de l'événement
-            for obj in event_data.get('Event', {}).get('Object', []):
+            for obj in event_info.get('Object', []):
                 for attr in obj.get('Attribute', []):
                     if attr.get('type') in ['suricata', 'snort'] and attr.get('to_ids'):
                         if verbose:
                             print(f"Attribut trouvé dans objet: ID {attr.get('id')} - Type {attr.get('type')}")
-                        suricata_attrs.append(attr.get('value'))
-            if suricata_attrs:
-                print(f"Trouvé {len(suricata_attrs)} attributs Suricata/Snort dans l'événement")
-                return suricata_attrs
+                        
+                        # Créer l'entrée de règle avec les métadonnées Diamond
+                        rule_entry = {
+                            'rule': attr.get('value'),
+                            'event_id': event_id,
+                            'event_info': event_info.get('info', ''),
+                            'date': event_info.get('date', ''),
+                            'tags': [tag.get('name', '') for tag in attr.get('Tag', [])],
+                            'diamond': extract_diamond_metadata(attr, event_info, obj=obj)
+                        }
+                        rule_entries.append(rule_entry)
+            
+            if rule_entries:
+                print(f"Trouvé {len(rule_entries)} attributs Suricata/Snort dans l'événement")
+                return rule_entries
             else:
                 print("Aucun attribut Suricata/Snort trouvé dans l'événement")
         else:
@@ -108,9 +155,24 @@ def extract_rules_from_event(misp_url, misp_key, event_id, verify_ssl=False, ver
             if content:
                 rules = [line.strip() for line in content.split('\n')
                          if line.strip() and not line.strip().startswith('#')]
+                
                 if rules:
                     print(f"Trouvé {len(rules)} règles via l'export Snort direct")
-                    return rules
+                    # Récupérer les informations de l'événement pour les métadonnées Diamond
+                    event_info = get_event_info(misp_url, misp_key, event_id, verify_ssl)
+                    
+                    rule_entries = []
+                    for rule in rules:
+                        rule_entry = {
+                            'rule': rule,
+                            'event_id': event_id,
+                            'event_info': event_info.get('info', ''),
+                            'date': event_info.get('date', ''),
+                            'tags': [],
+                            'diamond': analyze_rule_for_diamond(rule, event_info)
+                        }
+                        rule_entries.append(rule_entry)
+                    return rule_entries
                 else:
                     print("Aucune règle trouvée via l'export Snort")
             else:
@@ -120,6 +182,19 @@ def extract_rules_from_event(misp_url, misp_key, event_id, verify_ssl=False, ver
     except Exception as e:
         print(f"Erreur lors de l'export Snort: {str(e)}")
     return []
+
+def get_event_info(misp_url, misp_key, event_id, verify_ssl=False):
+    """Récupérer les informations d'un événement"""
+    headers = {'Authorization': misp_key, 'Accept': 'application/json'}
+    url = f"{misp_url}/events/view/{event_id}"
+    
+    try:
+        response = requests.get(url, headers=headers, verify=verify_ssl, timeout=15)
+        if response.status_code == 200:
+            return response.json().get('Event', {})
+    except:
+        pass
+    return {}
 
 def search_all_rules(misp_url, misp_key, verify_ssl=False, verbose=False):
     """
@@ -132,7 +207,7 @@ def search_all_rules(misp_url, misp_key, verify_ssl=False, verbose=False):
         verbose: Mode verbeux
 
     Returns:
-        Liste des règles trouvées
+        Liste des dictionnaires contenant les règles et leurs métadonnées Diamond
     """
     print("Recherche de tous les attributs Suricata/Snort dans MISP...")
     headers = {
@@ -150,6 +225,7 @@ def search_all_rules(misp_url, misp_key, verify_ssl=False, verbose=False):
                 "returnFormat": "json",
                 "type": ["suricata", "snort"],
                 "to_ids": 1,
+                "includeEvent": 1,  # Inclure les informations de l'événement
                 "limit": 10000  # Limite élevée pour obtenir tous les attributs
             },
             verify=verify_ssl,
@@ -162,14 +238,26 @@ def search_all_rules(misp_url, misp_key, verify_ssl=False, verbose=False):
                 print("Aucun attribut Suricata/Snort trouvé")
                 return []
             print(f"Trouvé {len(attributes)} attributs Suricata/Snort")
-            rules = []
+            
+            rule_entries = []
             for attr in attributes:
                 if 'value' in attr and attr.get('value', '').strip():
                     if verbose:
                         print(f"Attribut trouvé: Événement {attr.get('event_id')} - Type {attr.get('type')}")
-                    rules.append(attr.get('value'))
-            print(f"Extrait {len(rules)} règles")
-            return rules
+                    
+                    event_info = attr.get('Event', {})
+                    rule_entry = {
+                        'rule': attr.get('value'),
+                        'event_id': attr.get('event_id'),
+                        'event_info': event_info.get('info', ''),
+                        'date': event_info.get('date', ''),
+                        'tags': [tag.get('name', '') for tag in attr.get('Tag', [])],
+                        'diamond': extract_diamond_metadata(attr, event_info)
+                    }
+                    rule_entries.append(rule_entry)
+            
+            print(f"Extrait {len(rule_entries)} règles avec métadonnées Diamond")
+            return rule_entries
         else:
             print(f"Échec de la recherche: HTTP {response.status_code}")
             if verbose:
@@ -178,46 +266,254 @@ def search_all_rules(misp_url, misp_key, verify_ssl=False, verbose=False):
         print(f"Erreur lors de la recherche des attributs: {str(e)}")
     return []
 
-def write_rules_to_file(rules, output_file, event_id=None):
+def extract_diamond_metadata(attribute, event_info, obj=None):
     """
-    Écrire les règles dans un fichier
-
+    Extraire les métadonnées Diamond à partir des attributs et de l'événement
+    
     Args:
-        rules: Liste des règles à écrire
+        attribute: Dictionnaire de l'attribut
+        event_info: Métadonnées de l'événement
+        obj: Objet parent de l'attribut (optionnel)
+        
+    Returns:
+        Dictionnaire des métadonnées Diamond
+    """
+    diamond = {facet: [] for facet in DIAMOND_FACETS}
+    
+    # Extraire des informations depuis les tags
+    tags = attribute.get('Tag', [])
+    if obj:
+        tags.extend(obj.get('Tag', []))
+    tags.extend(event_info.get('Tag', []))
+    
+    for tag in tags:
+        tag_name = tag.get('name', '').lower()
+        
+        # Classification par facette Diamond
+        if any(term in tag_name for term in ['actor', 'threat-actor', 'apt', 'campaign']):
+            diamond['adversary'].append(tag.get('name'))
+        
+        elif any(term in tag_name for term in ['malware', 'tool', 'attack-pattern', 'technique']):
+            diamond['capability'].append(tag.get('name'))
+        
+        elif any(term in tag_name for term in ['infrastructure', 'c2', 'botnet', 'network']):
+            diamond['infrastructure'].append(tag.get('name'))
+        
+        elif any(term in tag_name for term in ['victim', 'target', 'sector', 'organization']):
+            diamond['victim'].append(tag.get('name'))
+    
+    # Extraire des informations supplémentaires de la règle elle-même
+    rule = attribute.get('value', '')
+    diamond_from_rule = analyze_rule_for_diamond(rule, event_info)
+    
+    # Fusionner les résultats
+    for facet in DIAMOND_FACETS:
+        diamond[facet].extend(diamond_from_rule[facet])
+        # Supprimer les doublons
+        diamond[facet] = list(set(diamond[facet]))
+    
+    return diamond
+
+def analyze_rule_for_diamond(rule, event_info):
+    """
+    Analyser une règle pour extraire des informations relatives au Diamond Model
+    
+    Args:
+        rule: Règle Suricata/Snort
+        event_info: Informations sur l'événement
+        
+    Returns:
+        Dictionnaire des métadonnées Diamond extraites de la règle
+    """
+    diamond = {facet: [] for facet in DIAMOND_FACETS}
+    
+    # Infrastructure - adresses IP, domaines, ports
+    ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
+    domain_pattern = r'\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\b'
+    
+    # Extraire les IPs
+    ips = re.findall(ip_pattern, rule)
+    if ips:
+        diamond['infrastructure'].extend([f"ip:{ip}" for ip in ips])
+    
+    # Extraire les domaines
+    domains = re.findall(domain_pattern, rule)
+    if domains:
+        diamond['infrastructure'].extend([f"domain:{domain}" for domain in domains])
+    
+    # Capability - Extraire des informations sur les capacités (protocoles, ports, etc.)
+    if "http" in rule.lower():
+        diamond['capability'].append("protocol:HTTP")
+    if "https" in rule.lower():
+        diamond['capability'].append("protocol:HTTPS")
+    if "dns" in rule.lower():
+        diamond['capability'].append("protocol:DNS")
+    if "ftp" in rule.lower():
+        diamond['capability'].append("protocol:FTP")
+    if "ssh" in rule.lower():
+        diamond['capability'].append("protocol:SSH")
+    if "smtp" in rule.lower():
+        diamond['capability'].append("protocol:SMTP")
+    
+    # Extraire les ports
+    port_pattern = r'port\s*:\s*(\d+)'
+    ports = re.findall(port_pattern, rule, re.IGNORECASE)
+    if ports:
+        diamond['capability'].extend([f"port:{port}" for port in ports])
+    
+    # Adversaire - à partir du titre de l'événement
+    event_title = event_info.get('info', '').lower()
+    apt_pattern = r'\b(apt\d+|kimsuky|lazarus|turla|equation|apt\s+\d+)\b'
+    apts = re.findall(apt_pattern, event_title, re.IGNORECASE)
+    if apts:
+        diamond['adversary'].extend([f"group:{apt}" for apt in apts])
+    
+    # Victime - à partir du titre de l'événement
+    org_keywords = ['government', 'bank', 'financial', 'military', 'defense', 'energy', 'healthcare']
+    for keyword in org_keywords:
+        if keyword in event_title:
+            diamond['victim'].append(f"sector:{keyword}")
+    
+    return diamond
+
+def organize_rules_by_diamond(rule_entries):
+    """
+    Organiser les règles selon les facettes du Diamond Model
+    
+    Args:
+        rule_entries: Liste des entrées de règles avec métadonnées Diamond
+        
+    Returns:
+        Dictionnaire avec les règles classées par facette Diamond
+    """
+    # Dictionnaire pour stocker les règles par facette
+    diamond_rules = {
+        'adversary': [],
+        'capability': [],
+        'infrastructure': [],
+        'victim': [],
+        'uncategorized': []  # Pour les règles non classifiables
+    }
+    
+    # Compteurs pour les statistiques
+    stats = {facet: 0 for facet in DIAMOND_FACETS}
+    stats['uncategorized'] = 0
+    
+    for entry in rule_entries:
+        diamond_metadata = entry.get('diamond', {})
+        
+        # Déterminer la facette principale de la règle
+        main_facet = None
+        max_annotations = 0
+        
+        for facet in DIAMOND_FACETS:
+            count = len(diamond_metadata.get(facet, []))
+            if count > max_annotations:
+                max_annotations = count
+                main_facet = facet
+        
+        if main_facet and max_annotations > 0:
+            diamond_rules[main_facet].append(entry)
+            stats[main_facet] += 1
+        else:
+            diamond_rules['uncategorized'].append(entry)
+            stats['uncategorized'] += 1
+    
+    print("Classification Diamond Model:")
+    for facet, count in stats.items():
+        print(f"  - {facet.capitalize()}: {count} règles")
+    
+    return diamond_rules
+
+def write_rules_to_file(rule_entries, output_file, event_id=None, use_diamond=False):
+    """
+    Écrire les règles dans un fichier, optionnellement organisées selon le Diamond Model
+    
+    Args:
+        rule_entries: Liste des entrées de règles avec métadonnées
         output_file: Fichier de sortie
         event_id: ID de l'événement (optionnel)
-
+        use_diamond: Utiliser la classification Diamond Model
+        
     Returns:
         True si l'écriture a réussi, False sinon
     """
-    if not rules:
+    if not rule_entries:
         print("Aucune règle à écrire")
         return False
 
-    # Dédoublonner en préservant l'ordre
+    # Extraire les règles uniques
+    all_rules = [entry.get('rule', '') for entry in rule_entries]
     unique_rules = []
     seen = set()
-    for rule in rules:
+    
+    # Conserver l'entrée de règle complète pour chaque règle unique
+    unique_entries = []
+    for i, rule in enumerate(all_rules):
         rule_stripped = rule.strip()
         if rule_stripped and rule_stripped not in seen:
             seen.add(rule_stripped)
             unique_rules.append(rule_stripped)
+            unique_entries.append(rule_entries[i])
 
     print(f"{len(unique_rules)} règles uniques après dédoublonnage")
 
     try:
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
-        with open(output_file, "w") as f:
-            header = f"# MISP Suricata/Snort Rules\n"
-            header += f"# Générées le {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            if event_id:
-                header += f"# Événement ID: {event_id}\n"
-            else:
-                header += "# Toutes les règles disponibles\n"
-            header += f"# {len(unique_rules)} règles au total\n\n"
-            f.write(header)
-            for rule in unique_rules:
-                f.write(rule + "\n")
+        
+        if use_diamond:
+            # Classification des règles selon le Diamond Model
+            diamond_rules = organize_rules_by_diamond(unique_entries)
+            
+            with open(output_file, "w") as f:
+                header = f"# MISP Suricata/Snort Rules - Diamond Model Classification\n"
+                header += f"# Générées le {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                if event_id:
+                    header += f"# Événement ID: {event_id}\n"
+                else:
+                    header += "# Toutes les règles disponibles\n"
+                header += f"# {len(unique_rules)} règles uniques au total\n\n"
+                f.write(header)
+                
+                # Écrire les règles par facette Diamond
+                for facet in ['adversary', 'capability', 'infrastructure', 'victim', 'uncategorized']:
+                    facet_rules = diamond_rules.get(facet, [])
+                    if facet_rules:
+                        f.write(f"\n# ===== {facet.upper()} ({len(facet_rules)} règles) =====\n\n")
+                        
+                        for entry in facet_rules:
+                            # Ajouter un commentaire avec les métadonnées Diamond avant la règle
+                            f.write("# " + "-" * 70 + "\n")
+                            f.write(f"# Event: {entry.get('event_id')} - {entry.get('event_info')}\n")
+                            f.write(f"# Date: {entry.get('date')}\n")
+                            
+                            # Écrire les métadonnées Diamond
+                            diamond_meta = entry.get('diamond', {})
+                            for d_facet in DIAMOND_FACETS:
+                                if diamond_meta.get(d_facet):
+                                    f.write(f"# {d_facet.capitalize()}: {', '.join(diamond_meta.get(d_facet))}\n")
+                            
+                            # Ajouter les tags
+                            if entry.get('tags'):
+                                f.write(f"# Tags: {', '.join(entry.get('tags'))}\n")
+                            
+                            # Écrire la règle
+                            f.write(entry.get('rule') + "\n\n")
+        else:
+            # Écriture classique sans classification Diamond
+            with open(output_file, "w") as f:
+                header = f"# MISP Suricata/Snort Rules\n"
+                header += f"# Générées le {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                if event_id:
+                    header += f"# Événement ID: {event_id}\n"
+                else:
+                    header += "# Toutes les règles disponibles\n"
+                header += f"# {len(unique_rules)} règles au total\n\n"
+                f.write(header)
+                
+                for rule in unique_rules:
+                    f.write(rule + "\n")
+        
         print(f"Règles écrites avec succès dans {output_file}")
         return True
     except Exception as e:
@@ -235,7 +531,7 @@ def main():
 
     # Extraction des règles
     if args.event:
-        rules = extract_rules_from_event(
+        rule_entries = extract_rules_from_event(
             misp_url,
             misp_key,
             args.event,
@@ -243,14 +539,21 @@ def main():
             verbose=args.verbose
         )
     else:
-        rules = search_all_rules(
+        rule_entries = search_all_rules(
             misp_url,
             misp_key,
             verify_ssl=verify_ssl,
             verbose=args.verbose
         )
+    
     # Écriture dans le fichier de règles
-    success = write_rules_to_file(rules, args.output, args.event)
+    success = write_rules_to_file(
+        rule_entries, 
+        args.output, 
+        args.event, 
+        use_diamond=args.diamond
+    )
+    
     if success:
         print("Opération terminée avec succès")
         return 0
