@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+
+
+import os
+import json
+import argparse
+import sys
+import requests
+import urllib3
+from datetime import datetime
+
+# Ignorer les avertissements SSL si verify_ssl est désactivé
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+def parse_args():
+    """Analyse des arguments de la ligne de commande"""
+    parser = argparse.ArgumentParser(description="Extraire les règles Suricata/Snort depuis MISP")
+    parser.add_argument(
+        "-c", "--config",
+        default="misp_config.json",
+        help="Fichier de configuration MISP (par défaut: misp_config.json)"
+    )
+    parser.add_argument(
+        "-o", "--output",
+        default="/etc/suricata/rules/misp_rules.rules",
+        help="Fichier de sortie pour les règles (par défaut: /etc/suricata/rules/misp_rules.rules)"
+    )
+    parser.add_argument(
+        "-e", "--event",
+        type=int,
+        help="ID d'un événement spécifique à extraire (optionnel)"
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Mode verbeux"
+    )
+    return parser.parse_args()
+
+def load_config(config_file):
+    """Charger la configuration à partir d'un fichier"""
+    try:
+        with open(config_file, "r") as f:
+            config = json.load(f)
+        # S'assurer que l'URL ne se termine pas par un slash
+        if config.get('misp_url', '').endswith('/'):
+            config['misp_url'] = config['misp_url'].rstrip('/')
+        return config
+    except Exception as e:
+        print(f"Erreur lors du chargement de la configuration: {str(e)}")
+        sys.exit(1)
+
+def extract_rules_from_event(misp_url, misp_key, event_id, verify_ssl=False, verbose=False):
+    """
+    Extraire les règles Suricata/Snort d'un événement spécifique
+    
+    Args:
+        misp_url: URL de l'instance MISP
+        misp_key: Clé API MISP
+        event_id: ID de l'événement
+        verify_ssl: Vérifier le certificat SSL
+        verbose: Mode verbeux
+
+    Returns:
+        Liste des règles trouvées (avec potentiel futur mapping Diamond)
+    """
+    headers = {'Authorization': misp_key, 'Accept': 'application/json'}
+    print(f"Extraction des règles de l'événement {event_id}...")
+    print(f"Méthode 1: Récupération JSON de l'événement {event_id}")
+    url = f"{misp_url}/events/{event_id}"
+
+    try:
+        response = requests.get(url, headers=headers, verify=verify_ssl, timeout=15)
+        if response.status_code == 200:
+            event_data = response.json()
+            suricata_attrs = []
+            # Extraction depuis la section principale des attributs
+            for attr in event_data.get('Event', {}).get('Attribute', []):
+                if attr.get('type') in ['suricata', 'snort'] and attr.get('to_ids'):
+                    if verbose:
+                        print(f"Attribut trouvé: ID {attr.get('id')} - Type {attr.get('type')}")
+                    suricata_attrs.append(attr.get('value'))
+            # Extraction dans les objets de l'événement
+            for obj in event_data.get('Event', {}).get('Object', []):
+                for attr in obj.get('Attribute', []):
+                    if attr.get('type') in ['suricata', 'snort'] and attr.get('to_ids'):
+                        if verbose:
+                            print(f"Attribut trouvé dans objet: ID {attr.get('id')} - Type {attr.get('type')}")
+                        suricata_attrs.append(attr.get('value'))
+            if suricata_attrs:
+                print(f"Trouvé {len(suricata_attrs)} attributs Suricata/Snort dans l'événement")
+                return suricata_attrs
+            else:
+                print("Aucun attribut Suricata/Snort trouvé dans l'événement")
+        else:
+            print(f"Échec de récupération de l'événement: HTTP {response.status_code}")
+    except Exception as e:
+        print(f"Erreur lors de la recherche des attributs: {str(e)}")
+
+    # Méthode alternative : Export direct au format Snort
+    print(f"Méthode 2: Export Snort direct pour l'événement {event_id}")
+    url = f"{misp_url}/events/restSearch/returnFormat:snort/eventid:{event_id}"
+
+    try:
+        response = requests.get(url, headers=headers, verify=verify_ssl, timeout=15)
+        if response.status_code == 200:
+            content = response.text.strip()
+            if content:
+                rules = [line.strip() for line in content.split('\n')
+                         if line.strip() and not line.strip().startswith('#')]
+                if rules:
+                    print(f"Trouvé {len(rules)} règles via l'export Snort direct")
+                    return rules
+                else:
+                    print("Aucune règle trouvée via l'export Snort")
+            else:
+                print("Export Snort vide")
+        else:
+            print(f"Échec de l'export Snort: HTTP {response.status_code}")
+    except Exception as e:
+        print(f"Erreur lors de l'export Snort: {str(e)}")
+    return []
+
+def search_all_rules(misp_url, misp_key, verify_ssl=False, verbose=False):
+    """
+    Rechercher toutes les règles Suricata/Snort disponibles dans MISP
+    
+    Args:
+        misp_url: URL de l'instance MISP
+        misp_key: Clé API MISP
+        verify_ssl: Vérifier le certificat SSL
+        verbose: Mode verbeux
+
+    Returns:
+        Liste des règles trouvées
+    """
+    print("Recherche de tous les attributs Suricata/Snort dans MISP...")
+    headers = {
+        'Authorization': misp_key,
+        'Accept': 'application/json',
+        'Content-Type': 'application/json'
+    }
+    url = f"{misp_url}/attributes/restSearch"
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json={
+                "returnFormat": "json",
+                "type": ["suricata", "snort"],
+                "to_ids": 1,
+                "limit": 10000  # Limite élevée pour obtenir tous les attributs
+            },
+            verify=verify_ssl,
+            timeout=30
+        )
+        if response.status_code == 200:
+            data = response.json()
+            attributes = data.get('response', {}).get('Attribute', [])
+            if not attributes:
+                print("Aucun attribut Suricata/Snort trouvé")
+                return []
+            print(f"Trouvé {len(attributes)} attributs Suricata/Snort")
+            rules = []
+            for attr in attributes:
+                if 'value' in attr and attr.get('value', '').strip():
+                    if verbose:
+                        print(f"Attribut trouvé: Événement {attr.get('event_id')} - Type {attr.get('type')}")
+                    rules.append(attr.get('value'))
+            print(f"Extrait {len(rules)} règles")
+            return rules
+        else:
+            print(f"Échec de la recherche: HTTP {response.status_code}")
+            if verbose:
+                print(f"Détail: {response.text[:500]}")
+    except Exception as e:
+        print(f"Erreur lors de la recherche des attributs: {str(e)}")
+    return []
+
+def write_rules_to_file(rules, output_file, event_id=None):
+    """
+    Écrire les règles dans un fichier
+
+    Args:
+        rules: Liste des règles à écrire
+        output_file: Fichier de sortie
+        event_id: ID de l'événement (optionnel)
+
+    Returns:
+        True si l'écriture a réussi, False sinon
+    """
+    if not rules:
+        print("Aucune règle à écrire")
+        return False
+
+    # Dédoublonner en préservant l'ordre
+    unique_rules = []
+    seen = set()
+    for rule in rules:
+        rule_stripped = rule.strip()
+        if rule_stripped and rule_stripped not in seen:
+            seen.add(rule_stripped)
+            unique_rules.append(rule_stripped)
+
+    print(f"{len(unique_rules)} règles uniques après dédoublonnage")
+
+    try:
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        with open(output_file, "w") as f:
+            header = f"# MISP Suricata/Snort Rules\n"
+            header += f"# Générées le {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            if event_id:
+                header += f"# Événement ID: {event_id}\n"
+            else:
+                header += "# Toutes les règles disponibles\n"
+            header += f"# {len(unique_rules)} règles au total\n\n"
+            f.write(header)
+            for rule in unique_rules:
+                f.write(rule + "\n")
+        print(f"Règles écrites avec succès dans {output_file}")
+        return True
+    except Exception as e:
+        print(f"Erreur lors de l'écriture dans le fichier: {str(e)}")
+        return False
+
+def main():
+    """Fonction principale"""
+    args = parse_args()
+    config = load_config(args.config)
+    misp_url = config.get('misp_url')
+    misp_key = config.get('misp_key')
+    verify_ssl = config.get('verify_ssl', False)
+    print(f"Connexion à MISP: {misp_url}")
+
+    # Extraction des règles
+    if args.event:
+        rules = extract_rules_from_event(
+            misp_url,
+            misp_key,
+            args.event,
+            verify_ssl=verify_ssl,
+            verbose=args.verbose
+        )
+    else:
+        rules = search_all_rules(
+            misp_url,
+            misp_key,
+            verify_ssl=verify_ssl,
+            verbose=args.verbose
+        )
+    # Écriture dans le fichier de règles
+    success = write_rules_to_file(rules, args.output, args.event)
+    if success:
+        print("Opération terminée avec succès")
+        return 0
+    else:
+        print("Échec de l'opération")
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
